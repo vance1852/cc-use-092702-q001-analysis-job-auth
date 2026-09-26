@@ -1,0 +1,67 @@
+{
+  "evidence_protocol_id": "demo-taxonomy-v1",
+  "version": 1,
+  "title": "昆虫形态与分子观察一致性复核",
+  "task_family": "insect-taxonomy",
+  "seed": 20260925,
+  "bootstrap_samples": 500,
+  "strata": [
+    {
+      "key": "morphology",
+      "label": "形态特征完整",
+      "required_reviews": 3
+    },
+    {
+      "key": "cross-method",
+      "label": "形态与分子记录交叉",
+      "required_reviews": 3
+    }
+  ],
+  "indicators": [
+    {
+      "key": "completed",
+      "label": "关键鉴定字段是否完整",
+      "kind": "binary",
+      "unit": null,
+      "direction": "higher"
+    },
+    {
+      "key": "completion_seconds",
+      "label": "采集时间线偏差秒数",
+      "kind": "continuous",
+      "unit": "s",
+      "direction": "lower"
+    },
+    {
+      "key": "interventions",
+      "label": "人工校订次数",
+      "kind": "count",
+      "unit": "count",
+      "direction": "lower"
+    }
+  ],
+  "evidence_group_weights": {
+    "morphology": "0.4",
+    "cross-method": "0.6"
+  },
+  "admission_rules": [
+    {
+      "indicator": "completed",
+      "statistic": "wilson_lower",
+      "operator": "gte",
+      "threshold": "0.29"
+    },
+    {
+      "indicator": "completion_seconds",
+      "statistic": "weighted_mean",
+      "operator": "lte",
+      "threshold": "65"
+    },
+    {
+      "indicator": "interventions",
+      "statistic": "weighted_mean",
+      "operator": "lte",
+      "threshold": "1.2"
+    }
+  ]
+}
