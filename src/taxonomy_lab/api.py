@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -115,16 +116,56 @@ class JsonApplication:
                 )
                 return Response(200, result)
             if method == "POST" and path == "/jobs/claim":
-                result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
-                return Response(200, {"job": result})
-            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
-                result = self.service.complete_job(
-                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
+                result = self.service.claim_job(
+                    self._actor(normalized_headers),
+                    int(payload.get("lease_seconds", 60)),
+                    request_key=normalized_headers.get("idempotency-key", "").strip() or None,
+                    job_id=int(payload["job_id"]) if payload.get("job_id") is not None else None,
                 )
+                return Response(200, {"job": result})
+            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "renew":
+                result = self.service.renew_job(
+                    self._actor(normalized_headers), int(parts[1]),
+                    int(payload.get("lease_seconds", 60)),
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
+                result = self.service.complete_job(self._actor(normalized_headers), int(parts[1]))
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "fail":
                 result = self.service.fail_job(
-                    payload["worker_id"], int(parts[1]), payload["error"], int(payload.get("retry_seconds", 0))
+                    self._actor(normalized_headers), int(parts[1]), payload["error"],
+                    int(payload.get("retry_seconds", 0)),
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "release":
+                result = self.service.release_job(
+                    self._actor(normalized_headers), int(parts[1]), payload["reason"]
+                )
+                return Response(200, result)
+            if method == "GET" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "timeline":
+                return Response(
+                    200, self.service.job_timeline(self._actor(normalized_headers), int(parts[1]))
+                )
+            if method == "POST" and path == "/users/deactivate":
+                result = self.service.set_user_active(
+                    self._actor(normalized_headers), payload["user_id"], False, payload.get("reason", "")
+                )
+                return Response(200, result)
+            if method == "POST" and path == "/users/activate":
+                result = self.service.set_user_active(
+                    self._actor(normalized_headers), payload["user_id"], True, payload.get("reason", "")
+                )
+                return Response(200, result)
+            if method == "POST" and path == "/qualifications":
+                result = self.service.grant_qualification(
+                    self._actor(normalized_headers), payload["user_id"], payload["task_family"]
+                )
+                return Response(201, result)
+            if method == "POST" and path == "/qualifications/revoke":
+                result = self.service.revoke_qualification(
+                    self._actor(normalized_headers), payload["user_id"],
+                    payload["task_family"], payload["reason"],
                 )
                 return Response(200, result)
             if method == "POST" and path == "/decisions":
@@ -140,7 +181,7 @@ class JsonApplication:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 
 
-def make_handler(application: JsonApplication):
+def make_handler(application: JsonApplication, request_lock: threading.Lock):
     class Handler(BaseHTTPRequestHandler):
         server_version = "DeviceReviews/1"
 
@@ -153,7 +194,9 @@ def make_handler(application: JsonApplication):
         def _dispatch(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length) if length else b""
-            response = application.handle(self.command, self.path, dict(self.headers.items()), body)
+            # 单一 SQLite 连接在同一时刻只允许一个写事务；串行化请求处理。
+            with request_lock:
+                response = application.handle(self.command, self.path, dict(self.headers.items()), body)
             encoded = json.dumps(response.body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             self.send_response(response.status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -175,7 +218,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     connection = connect(args.database)
     application = JsonApplication(TaxonomyLabService(connection))
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(application))
+    server = ThreadingHTTPServer(
+        (args.host, args.port), make_handler(application, threading.Lock())
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
