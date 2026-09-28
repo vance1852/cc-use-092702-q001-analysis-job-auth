@@ -47,3 +47,13 @@ PYTHONPATH=src python3 -m biosafety_ops.api --database safety.sqlite3 --host 127
 ~~~
 
 服务提供浏览器无关的 JSON 接口和健康检查。进程重启后可以继续读取 SQLite 中的业务状态与审计历史。
+
+## 分析任务租约安全
+
+分析任务（封存批次后生成）的领取与接管遵循以下规则，全部在 `taxonomy_lab` 中实现：
+
+- **身份与资格**：领取、续作、完成、失败和接管都要求账号处于启用状态、具备 `analysis.run` 岗位权限（统计人员），并且账号被显式授予任务的 `task_family`（任务适用范围，来源于证据协议）。账号由审批人通过 `PATCH /users/{id}` 停用/启用、`POST /users/{id}/task_families` 授权；外协账号停用或未授权后无法再领取或提交结果。
+- **可追溯租约**：每次占用都写入 `lease_owner`（操作者账号）和唯一的 `lease_fence_token`（栅栏令牌）；完成、失败、续作、接管都校验持有者与栅栏令牌。
+- **到期接管**：租约到期后只有合格人员可通过再次领取或 `POST /jobs/{id}/takeover` 接管；旧持有者的迟到完成/失败一律以 409 拒绝，其结论在同一事务内回滚，不会覆盖新结论。续作使用 `POST /jobs/{id}/renew`。
+- **稳定重放**：领取请求携带 `Idempotency-Key` 头时，同一账号、同一租约时长的重放返回首次结果；同键不同请求返回 409。
+- **占用原因可查**：领取（`job.claimed`）、续作（`job.renewed`）、完成释放（`job.completed`）、失败释放（`job.failed`）、接管（`job.taken_over`）以及每次拒绝（`job.lease_rejected`，原因码如 `account_inactive`、`role_not_allowed`、`task_family_not_granted`、`lease_expired`、`stale_lease_holder`、`lease_active`）都按全局自增顺序写入 `lease_events`，可通过 `GET /jobs/lease_events`（或批次报告中的 `lease_events`）查询，服务重启后顺序完整还原。

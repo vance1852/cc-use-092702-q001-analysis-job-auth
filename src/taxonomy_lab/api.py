@@ -60,6 +60,16 @@ class JsonApplication:
             if method == "POST" and path == "/users":
                 result = self.service.create_user(payload["user_id"], payload["display_name"], payload["role"])
                 return Response(201, result)
+            if method == "PATCH" and len(parts) == 2 and parts[0] == "users":
+                result = self.service.set_user_active(
+                    self._actor(normalized_headers), parts[1], bool(payload["active"])
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "users" and parts[2] == "task_families":
+                result = self.service.grant_task_family(
+                    self._actor(normalized_headers), parts[1], payload["task_family"]
+                )
+                return Response(201, result)
             if method == "POST" and path == "/capture_devices":
                 result = self.service.register_device(
                     self._actor(normalized_headers), payload["device_id"], payload["model_name"], payload["vendor"]
@@ -115,18 +125,41 @@ class JsonApplication:
                 )
                 return Response(200, result)
             if method == "POST" and path == "/jobs/claim":
-                result = self.service.claim_job(payload["worker_id"], int(payload.get("lease_seconds", 60)))
+                key = normalized_headers.get("idempotency-key", "").strip() or None
+                result = self.service.claim_job(
+                    self._actor(normalized_headers),
+                    int(payload.get("lease_seconds", 60)),
+                    idempotency_key=key,
+                )
                 return Response(200, {"job": result})
+            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "renew":
+                result = self.service.renew_job(
+                    self._actor(normalized_headers), int(parts[1]), int(payload.get("lease_seconds", 60))
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "takeover":
+                result = self.service.takeover_job(
+                    self._actor(normalized_headers), int(parts[1]), int(payload.get("lease_seconds", 60))
+                )
+                return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "complete":
                 result = self.service.complete_job(
-                    payload["worker_id"], int(parts[1]), self._actor(normalized_headers)
+                    self._actor(normalized_headers), int(parts[1]), payload.get("lease_fence_token")
                 )
                 return Response(200, result)
             if method == "POST" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "fail":
                 result = self.service.fail_job(
-                    payload["worker_id"], int(parts[1]), payload["error"], int(payload.get("retry_seconds", 0))
+                    self._actor(normalized_headers), int(parts[1]), payload["error"],
+                    int(payload.get("retry_seconds", 0)), payload.get("lease_fence_token"),
                 )
                 return Response(200, result)
+            if method == "GET" and path == "/jobs/lease_events":
+                return Response(200, {"events": self.service.lease_history(self._actor(normalized_headers))})
+            if method == "GET" and len(parts) == 3 and parts[0] == "jobs" and parts[2] == "lease_events":
+                return Response(
+                    200,
+                    {"events": self.service.lease_history(self._actor(normalized_headers), int(parts[1]))},
+                )
             if method == "POST" and path == "/decisions":
                 result = self.service.decide(
                     self._actor(normalized_headers), payload["batch_id"], int(payload["analysis_id"]),

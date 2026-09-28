@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -35,6 +35,24 @@ CREATE TABLE IF NOT EXISTS users (
     display_name TEXT NOT NULL,
     role TEXT NOT NULL CHECK (role IN ('operator', 'statistician', 'approver', 'auditor')),
     active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1))
+);
+
+CREATE TABLE IF NOT EXISTS user_task_families (
+    user_id TEXT NOT NULL REFERENCES users(user_id),
+    task_family TEXT NOT NULL,
+    granted_by TEXT NOT NULL REFERENCES users(user_id),
+    granted_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, task_family)
+);
+
+CREATE TABLE IF NOT EXISTS job_claim_requests (
+    scope TEXT NOT NULL,
+    key TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    job_id INTEGER REFERENCES analysis_jobs(job_id),
+    response_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (scope, key)
 );
 
 CREATE TABLE IF NOT EXISTS capture_devices (
@@ -117,10 +135,25 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
     available_at TEXT NOT NULL,
     lease_owner TEXT,
     lease_expires_at TEXT,
+    lease_fence_token TEXT,
     last_error TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (batch_id, batch_revision)
+);
+
+CREATE TABLE IF NOT EXISTS lease_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER REFERENCES analysis_jobs(job_id),
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'job.claimed', 'job.renewed', 'job.completed', 'job.failed', 'job.taken_over', 'job.lease_rejected'
+    )),
+    actor_id TEXT NOT NULL,
+    previous_owner TEXT,
+    lease_fence_token TEXT,
+    lease_expires_at TEXT,
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS analyses (
@@ -160,9 +193,9 @@ CREATE TABLE IF NOT EXISTS audit_events (
 """
 
 REQUIRED_TABLES = frozenset({
-    "schema_meta", "evidence_protocol_catalog", "users", "capture_devices", "builds", "batches",
-    "evidence_items", "idempotency_keys", "exclusion_requests", "analysis_jobs",
-    "analyses", "decisions", "audit_events",
+    "schema_meta", "evidence_protocol_catalog", "users", "user_task_families", "capture_devices", "builds",
+    "batches", "evidence_items", "idempotency_keys", "job_claim_requests", "exclusion_requests",
+    "analysis_jobs", "lease_events", "analyses", "decisions", "audit_events",
 })
 
 
@@ -190,10 +223,18 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _column_names(connection: sqlite3.Connection, table: str) -> frozenset[str]:
+    return frozenset(row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall())
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
+    # 旧版数据库升级：CREATE TABLE IF NOT EXISTS 不会为已存在的表补齐新列。
+    job_columns = _column_names(connection, "analysis_jobs")
+    if job_columns and "lease_fence_token" not in job_columns:
+        connection.execute("ALTER TABLE analysis_jobs ADD COLUMN lease_fence_token TEXT")
     with transaction(connection, immediate=True):
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "

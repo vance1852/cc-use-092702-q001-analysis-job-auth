@@ -19,7 +19,7 @@ class StorageTests(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual(summary["missing_tables"], [])
-        self.assertEqual(summary["schema_version"], "2")
+        self.assertEqual(summary["schema_version"], "3")
 
     def test_transaction_rolls_back_on_error(self) -> None:
         connection = sqlite3.connect(":memory:", isolation_level=None)

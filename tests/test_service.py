@@ -24,11 +24,16 @@ class ServiceTests(unittest.TestCase):
         for user_id, role in (
             ("operator", "operator"),
             ("stat", "statistician"),
+            ("stat-b", "statistician"),
             ("approver", "approver"),
             ("auditor", "auditor"),
+            ("contractor", "statistician"),
         ):
             self.service.create_user(user_id, user_id, role)
         self.evidence_protocol = load_json(ROOT / "fixtures" / "demo_evidence_protocol.json")
+        self.task_family = self.evidence_protocol["task_family"]
+        self.service.grant_task_family("approver", "stat", self.task_family)
+        self.service.grant_task_family("approver", "stat-b", self.task_family)
         self.rows = [
             json.loads(line)
             for line in (ROOT / "fixtures" / "demo_evidence_items.jsonl").read_text(encoding="utf-8").splitlines()
@@ -47,8 +52,8 @@ class ServiceTests(unittest.TestCase):
         imported = self.service.import_evidence_items("operator", "batch-a", "key-1", self.rows)
         self.assertEqual(imported["inserted"], 6)
         self.service.seal_batch("stat", "batch-a", 2)
-        job = self.service.claim_job("worker", 30)
-        analysis = self.service.complete_job("worker", job["job_id"], "stat")
+        job = self.service.claim_job("stat", 30)
+        analysis = self.service.complete_job("stat", job["job_id"], job["lease_fence_token"])
         self.service.decide("approver", "batch-a", analysis["analysis_id"], "approved", "满足规则")
         report = self.service.report("auditor", "batch-a")
         self.assertEqual(report["batch"]["state"], "decided")
@@ -99,25 +104,105 @@ class ServiceTests(unittest.TestCase):
     def test_failed_job_returns_to_queue_after_delay(self) -> None:
         self.service.import_evidence_items("operator", "batch-a", "key-1", self.rows)
         self.service.seal_batch("stat", "batch-a", 2)
-        job = self.service.claim_job("worker-a", 10)
-        failed = self.service.fail_job("worker-a", job["job_id"], "临时计算失败", retry_seconds=5)
+        job = self.service.claim_job("stat", 10)
+        failed = self.service.fail_job(
+            "stat", job["job_id"], "临时计算失败", retry_seconds=5, fence_token=job["lease_fence_token"]
+        )
         self.assertEqual(failed["state"], "queued")
-        self.assertIsNone(self.service.claim_job("worker-b", 10))
+        self.assertIsNone(self.service.claim_job("stat-b", 10))
         self.clock.advance(seconds=5)
-        retried = self.service.claim_job("worker-b", 10)
+        retried = self.service.claim_job("stat-b", 10)
         self.assertEqual(retried["job_id"], job["job_id"])
         self.assertEqual(retried["attempts"], 2)
 
     def test_lease_can_be_reclaimed_after_expiry(self) -> None:
         self.service.import_evidence_items("operator", "batch-a", "key-1", self.rows)
         self.service.seal_batch("stat", "batch-a", 2)
-        first = self.service.claim_job("worker-a", 10)
+        first = self.service.claim_job("stat", 10)
         self.clock.advance(seconds=11)
-        second = self.service.claim_job("worker-b", 10)
+        second = self.service.claim_job("stat-b", 10)
         self.assertEqual(first["job_id"], second["job_id"])
-        self.assertEqual(second["lease_owner"], "worker-b")
+        self.assertEqual(second["lease_owner"], "stat-b")
+        self.assertNotEqual(second["lease_fence_token"], first["lease_fence_token"])
         with self.assertRaises(InvalidState):
-            self.service.complete_job("worker-a", first["job_id"], "stat")
+            self.service.complete_job("stat", first["job_id"], first["lease_fence_token"])
+
+    def test_deactivated_account_cannot_claim_or_keep_lease(self) -> None:
+        self.service.import_evidence_items("operator", "batch-a", "key-1", self.rows)
+        self.service.seal_batch("stat", "batch-a", 2)
+        self.service.set_user_active("approver", "stat-b", False)
+        with self.assertRaises(Forbidden):
+            self.service.claim_job("stat-b", 10)
+        job = self.service.claim_job("stat", 10)
+        self.service.set_user_active("approver", "stat", False)
+        with self.assertRaises(Forbidden):
+            self.service.complete_job("stat", job["job_id"], job["lease_fence_token"])
+        self.clock.advance(seconds=11)
+        self.service.set_user_active("approver", "stat-b", True)
+        takeover = self.service.claim_job("stat-b", 10)
+        self.assertEqual(takeover["job_id"], job["job_id"])
+        # 停用的旧持有者迟到完成，不得覆盖新持有者。
+        with self.assertRaises(Forbidden):
+            self.service.complete_job("stat", job["job_id"], job["lease_fence_token"])
+        reject_events = self.connection.execute(
+            "SELECT reason FROM lease_events WHERE event_type='job.lease_rejected' ORDER BY event_id"
+        ).fetchall()
+        self.assertTrue(any("account_inactive" in row[0] for row in reject_events))
+
+    def test_account_without_task_family_grant_cannot_claim(self) -> None:
+        self.service.import_evidence_items("operator", "batch-a", "key-1", self.rows)
+        self.service.seal_batch("stat", "batch-a", 2)
+        # 未授予任务适用范围：队列中没有可领取的任务，并记录拒绝原因。
+        self.assertIsNone(self.service.claim_job("contractor", 10))
+        rejection = self.connection.execute(
+            "SELECT reason FROM lease_events WHERE event_type='job.lease_rejected' ORDER BY event_id DESC LIMIT 1"
+        ).fetchone()
+        self.assertIn("task_family_not_granted", rejection[0])
+        # 有资格的统计人员仍然能领到同一个任务。
+        job = self.service.claim_job("stat", 10)
+        self.assertIsNotNone(job)
+
+    def test_claim_replay_returns_stable_state(self) -> None:
+        self.service.import_evidence_items("operator", "batch-a", "key-1", self.rows)
+        self.service.seal_batch("stat", "batch-a", 2)
+        first = self.service.claim_job("stat", 10, idempotency_key="claim-1")
+        self.service.fail_job(
+            "stat", first["job_id"], "重新计算", retry_seconds=0, fence_token=first["lease_fence_token"]
+        )
+        replayed = self.service.claim_job("stat", 10, idempotency_key="claim-1")
+        self.assertEqual(replayed, first)
+        with self.assertRaises(Conflict):
+            self.service.claim_job("stat", 20, idempotency_key="claim-1")
+
+    def test_explicit_takeover_and_stale_fence_are_rejected(self) -> None:
+        self.service.import_evidence_items("operator", "batch-a", "key-1", self.rows)
+        self.service.seal_batch("stat", "batch-a", 2)
+        job = self.service.claim_job("stat", 10)
+        with self.assertRaises(InvalidState):
+            self.service.takeover_job("stat-b", job["job_id"], 10)
+        self.clock.advance(seconds=11)
+        taken = self.service.takeover_job("stat-b", job["job_id"], 10)
+        self.assertEqual(taken["taken_over_from"], "stat")
+        with self.assertRaises(InvalidState):
+            self.service.complete_job("stat", job["job_id"], job["lease_fence_token"])
+        events = [
+            row[0]
+            for row in self.connection.execute(
+                "SELECT event_type FROM lease_events WHERE job_id=? ORDER BY event_id", (job["job_id"],)
+            ).fetchall()
+        ]
+        self.assertEqual(
+            events,
+            ["job.claimed", "job.lease_rejected", "job.taken_over", "job.lease_rejected"],
+        )
+        reasons = [
+            row[0]
+            for row in self.connection.execute(
+                "SELECT reason FROM lease_events WHERE job_id=? ORDER BY event_id", (job["job_id"],)
+            ).fetchall()
+        ]
+        self.assertIn("lease_active", reasons[1])
+        self.assertIn("stale_lease_holder", reasons[3])
 
 
 if __name__ == "__main__":
